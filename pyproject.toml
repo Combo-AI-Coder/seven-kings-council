@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seven-kings-council"
+version = "1.2.0a1"
+description = "Deterministic, auditable 20-round political strategy game"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Seven Kings Council contributors"}]
+
+[project.scripts]
+seven-kings = "seven_kings.engine:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
