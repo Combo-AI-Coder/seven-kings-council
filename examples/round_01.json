@@ -1,0 +1,9 @@
+{
+  "action": {"type": "reform"},
+  "diplomacy": {"type": "none"},
+  "court": {"type": "joint_project", "target": "D"},
+  "reply": "decline",
+  "vote": "yes",
+  "sway": 0,
+  "bid": 0
+}

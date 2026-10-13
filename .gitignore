@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+dist/
+build/
+*.egg-info/
+.env
+# Do not commit live campaign secrets or unsealed archives
+campaigns/
+private/
+**/secrets.json
+**/gm_sealed.json
+**/audit.jsonl
+**/state.json
+**/initial_state.json
+**/docket.json
