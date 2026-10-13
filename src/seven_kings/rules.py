@@ -183,7 +183,8 @@ def backing_threshold(state, voter, candidate):
 def promised(state, voter, round_no):
     for contract in state["contracts"]:
         if contract["voter"] == voter and contract["election_round"] == round_no:
-            if pact(state, voter, contract["candidate"]):
+            partner = contract.get("partner", contract["candidate"])
+            if pact(state, voter, partner):
                 return contract["candidate"]
     return None
 
@@ -527,18 +528,21 @@ def _record_refusal(s, a, b):
         adjust_relation(s, a, b, tension=1)
 
 
-def sign_contract(s, voter, candidate, r, out, label):
+def sign_contract(s, voter, candidate, r, out, label, *, partner=None):
+    # Backing binds voter and nominee; a coalition binds its two signers,
+    # even when they nominate one of themselves or an unrelated third house.
+    partner = candidate if partner is None else partner
     election = next_election(r)
-    if election is None or not pact(s, voter, candidate):
+    if election is None or not pact(s, voter, partner):
         return False
     s["contracts"] = [
         x for x in s["contracts"]
         if not (x["voter"] == voter and x["election_round"] == election)]
     s["contracts"].append({
         "voter": voter, "candidate": candidate, "election_round": election,
-        "origin": label})
+        "origin": label, "partner": partner})
     _log(out, "backing_signed", voter=voter, candidate=candidate,
-         election_round=election, origin=label)
+         election_round=election, origin=label, partner=partner)
     return True
 
 
@@ -632,12 +636,9 @@ def player_court(s, r, court, vote, out):
             spend(s, "A", "gold", 1)
             spend(s, t, "gold", 1)
             adjust_relation(s, "A", t, capital=2, tension=-1)
-            if candidate != t:
-                sign_contract(s, t, candidate, r, out, "player_coalition")
-            s["contracts"].append({
-                "voter": "A", "candidate": candidate,
-                "election_round": next_election(r),
-                "origin": "player_coalition"})
+            for voter, partner in (("A", t), (t, "A")):
+                sign_contract(s, voter, candidate, r, out, "player_coalition",
+                              partner=partner)
             _log(out, "coalition_formed", a="A", b=t, candidate=candidate)
         else:
             _record_refusal(s, "A", t)
@@ -675,15 +676,9 @@ def npc_court(s, r, actor, plan, out):
         spend(s, target, "gold", 1)
         adjust_relation(s, actor, target, capital=2, tension=-1)
         # The nomination is binding for both politicians, not for the nominee.
-        for voter in (actor, target):
-            if voter != candidate and pact(s, voter, candidate):
-                sign_contract(s, voter, candidate, r, out, "npc_coalition")
-            elif voter == candidate:
-                # A politician's vote for themselves needs no pact contract.
-                s["contracts"].append({
-                    "voter": voter, "candidate": candidate,
-                    "election_round": next_election(r),
-                    "origin": "npc_coalition"})
+        for voter, partner in ((actor, target), (target, actor)):
+            sign_contract(s, voter, candidate, r, out, "npc_coalition",
+                          partner=partner)
         _log(out, "npc_coalition", a=actor, b=target, candidate=candidate)
 
 
@@ -926,20 +921,27 @@ def execute_round(state, secret, raw_command):
         change(s, winner, "crowns", 1)
         change(s, winner, "prestige", 2)
         change(s, winner, "gold", 2)
+        rewarded_contracts = set()
         for contract in list(s["contracts"]):
             if contract["election_round"] != r:
                 continue
             voter, chosen = contract["voter"], contract["candidate"]
-            if voter == "A":
-                if chosen != command["candidate"]:
-                    change(s, "A", "scandal", 2)
-                    adjust_relation(s, "A", chosen, trust_delta=-2, tension=2)
-                    _log(out, "player_broke_coalition", candidate=chosen)
-                else:
-                    adjust_relation(s, voter, chosen, capital=2, tension=-1)
-            elif pact(s, voter, chosen) and out["election_votes"][voter]["candidate"] == chosen:
-                adjust_relation(s, voter, chosen, capital=2, tension=-1)
-                _log(out, "contract_honored", voter=voter, candidate=chosen)
+            partner = contract.get("partner", chosen)
+            if not pact(s, voter, partner):
+                continue
+            if voter == "A" and chosen != command["candidate"]:
+                change(s, "A", "scandal", 2)
+                adjust_relation(s, "A", partner, trust_delta=-2, tension=2)
+                _log(out, "player_broke_coalition", candidate=chosen)
+            elif out["election_votes"][voter]["candidate"] == chosen:
+                # The reciprocal coalition records describe one agreement;
+                # do not double its shared relationship reward.
+                reward_key = (pair(voter, partner), chosen)
+                if reward_key not in rewarded_contracts:
+                    adjust_relation(s, voter, partner, capital=2, tension=-1)
+                    rewarded_contracts.add(reward_key)
+                if voter != "A":
+                    _log(out, "contract_honored", voter=voter, candidate=chosen)
         # Distinguish coalition-wide alignment from rival uncoordinated ballots.
         for p in s["pacts"]:
             a, b = p["a"], p["b"]
