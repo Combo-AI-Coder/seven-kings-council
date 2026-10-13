@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from seven_kings import rules
 from seven_kings import engine
@@ -154,6 +155,36 @@ class CooperativePolitics(unittest.TestCase):
         self.state = rules.opening_state(SEED)
         self.private = {"seed": SEED, "goals": rules.secret_goals(SEED)}
 
+    def election(self, state, *, candidate="A"):
+        """Run a real election without unrelated NPC actions replacing promises."""
+        state["round"] = 3
+        for p in state["pacts"]:
+            p["expires_after_round"] = 4
+        plans = {
+            h: {"action": "pass", "diplomacy_priorities": [],
+                "court": {"type": "none"}}
+            for h in rules.NPCS
+        }
+        with patch.object(rules, "npc_plans", return_value=plans):
+            c = command(state, SEED, action="pass", bid=0)
+            c["candidate"] = candidate
+            return rules.execute_round(state, self.private, c)
+
+    def third_party_coalition(self, *, tension=0):
+        s = self.state
+        rules.relationship(s, "B", "E").update(
+            trust=5, capital=10, tension=tension)
+        for h in ("B", "E"):
+            # E scores D at 35 versus B at 46 (43 with tension 1).
+            # The gap must be within capital + 2 before a coalition can form.
+            rules.relationship(s, h, "D").update(trust=5, capital=9)
+        out = {"events": []}
+        rules.npc_court(s, 4, "B",
+                        {"court": {"type": "coalition", "target": "E",
+                                   "candidate": "D"}}, out)
+        self.assertTrue(any(e["code"] == "npc_coalition" for e in out["events"]))
+        return s
+
     def test_beyond_trust_cap_cooperation_accumulates_capital(self):
         s = self.state
         rel = rules.relationship(s, "A", "D")
@@ -222,38 +253,150 @@ class CooperativePolitics(unittest.TestCase):
         self.assertEqual(out["events"][-1]["code"], "joint_project")
 
     def test_npc_coalition_is_binding_for_two_signers(self):
+        for actor, target in (("B", "E"), ("E", "B")):
+            with self.subTest(actor=actor):
+                s = rules.opening_state(SEED)
+                rules.relationship(s, actor, target).update(trust=5, capital=8)
+                out = {"events": []}
+                plan = {"court": {"type": "coalition", "target": target,
+                                  "candidate": actor}}
+                rules.npc_court(s, 4, actor, plan, out)
+                self.assertTrue(any(e["code"] == "npc_coalition"
+                                    for e in out["events"]))
+                self.assertEqual(rules.promised(s, actor, 4), actor)
+                self.assertEqual(rules.promised(s, target, 4), actor)
+                _, result = self.election(s)
+                for voter in (actor, target):
+                    self.assertEqual(result["election_votes"][voter]["candidate"], actor)
+                    self.assertTrue(result["election_votes"][voter]["contract"])
+
+    def test_npc_coalition_can_nominate_receiver(self):
         s = self.state
-        rules.relationship(s, "B", "E")["trust"] = 5
-        rules.relationship(s, "B", "E")["capital"] = 8
+        s["houses"]["B"]["scandal"] = 10
+        s["houses"]["E"]["prestige"] = 16
         out = {"events": []}
-        plan = {"court": {"type": "coalition", "target": "E", "candidate": "B"}}
-        rules.npc_court(s, 4, "B", plan, out)
-        self.assertEqual(rules.promised(s, "B", 4), "B")
-        self.assertEqual(rules.promised(s, "E", 4), "B")
+        rules.npc_court(s, 4, "B",
+                        {"court": {"type": "coalition", "target": "E",
+                                   "candidate": "E"}}, out)
+        self.assertEqual(rules.promised(s, "B", 4), "E")
+        self.assertEqual(rules.promised(s, "E", 4), "E")
+
+    def test_coalition_honor_reward_is_not_doubled(self):
+        s = self.state
+        rules.npc_court(s, 4, "B",
+                        {"court": {"type": "coalition", "target": "E",
+                                   "candidate": "B"}}, {"events": []})
+        self.assertEqual(len(s["contracts"]), 2)
+        self.assertEqual(rules.relationship(s, "B", "E")["capital"], 2)
+        result, out = self.election(s)
+        council_alignment = int(out["council_votes"]["B"]["vote"] ==
+                                out["council_votes"]["E"]["vote"])
+        # Formation + council alignment + one honor bonus + election alignment.
+        self.assertEqual(rules.relationship(result, "B", "E")["capital"],
+                         2 + council_alignment + 2 + 1)
 
     def test_coalition_to_third_party_keeps_both_voters_bound(self):
-        s = self.state
-        rules.relationship(s, "B", "E")["trust"] = 5
-        rules.relationship(s, "B", "E")["capital"] = 10
-        for h in ("B", "E"):
-            rules.relationship(s, h, "D")["trust"] = 5
-            rules.relationship(s, h, "D")["capital"] = 8
-        out = {"events": []}
-        plan = {"court": {"type": "coalition", "target": "E", "candidate": "D"}}
-        rules.npc_court(s, 4, "B", plan, out)
+        s = self.third_party_coalition()
+        self.assertFalse(rules.pact(s, "B", "D"))
+        self.assertFalse(rules.pact(s, "E", "D"))
         self.assertEqual(rules.promised(s, "B", 4), "D")
         self.assertEqual(rules.promised(s, "E", 4), "D")
+        self.assertIsNone(rules.promised(s, "D", 4))
+        self.assertIsNone(rules.promised(s, "B", 8))
 
     def test_joint_third_party_vote_is_not_misclassified_as_betrayal(self):
+        s = self.third_party_coalition(tension=1)
+        self.assertEqual(rules.relationship(s, "B", "E")["tension"], 0)
+        result, out = self.election(s)
+        for voter in ("B", "E"):
+            self.assertEqual(out["election_votes"][voter]["candidate"], "D")
+            self.assertTrue(out["election_votes"][voter]["contract"])
+        self.assertEqual(rules.relationship(result, "B", "E")["tension"], 0)
+        self.assertEqual(result["contracts"], [])
+
+    def test_uncoordinated_allied_votes_still_increase_tension(self):
+        s = self.state
+        rules.relationship(s, "B", "D").update(trust=5, capital=10)
+        rules.relationship(s, "E", "G").update(trust=5, capital=10)
+        result, out = self.election(s)
+        self.assertEqual(out["election_votes"]["B"]["candidate"], "D")
+        self.assertEqual(out["election_votes"]["E"]["candidate"], "G")
+        self.assertEqual(rules.relationship(result, "B", "E")["tension"], 1)
+
+    def test_unattractive_third_party_coalition_is_still_rejected(self):
         s = self.state
         rel = rules.relationship(s, "B", "E")
-        rel["trust"], rel["capital"], rel["tension"] = 5, 10, 1
+        rel.update(trust=5, capital=10, tension=1)
+        gold = {h: s["houses"][h]["gold"] for h in ("B", "E")}
         out = {"events": []}
         rules.npc_court(s, 4, "B",
                         {"court": {"type": "coalition", "target": "E",
                                    "candidate": "D"}}, out)
-        self.assertEqual(rel["tension"], 0)
-        self.assertTrue(any(x["code"] == "npc_coalition" for x in out["events"]))
+        self.assertEqual(rel["tension"], 1)
+        self.assertEqual(rel["refusals"], 1)
+        self.assertEqual(s["contracts"], [])
+        self.assertFalse(out["events"])
+        self.assertEqual({h: s["houses"][h]["gold"] for h in gold}, gold)
+
+    def test_replacement_coalition_has_one_promise_per_voter(self):
+        s = self.third_party_coalition()
+        rules.npc_court(s, 4, "B",
+                        {"court": {"type": "coalition", "target": "E",
+                                   "candidate": "B"}}, {"events": []})
+        self.assertEqual(len(s["contracts"]), 2)
+        for voter in ("B", "E"):
+            self.assertEqual(rules.promised(s, voter, 4), "B")
+
+    def test_coalition_requires_signers_pact_even_if_nominee_is_allied(self):
+        s = self.third_party_coalition()
+        s["pacts"] = [{"a": h, "b": "D", "expires_after_round": 4}
+                      for h in ("B", "E")]
+        for voter in ("B", "E"):
+            self.assertIsNone(rules.promised(s, voter, 4))
+        _, out = self.election(s)
+        for voter in ("B", "E"):
+            self.assertFalse(out["election_votes"][voter]["contract"])
+        self.assertFalse(any(e["code"] == "contract_honored" for e in out["events"]))
+
+    def test_player_coalition_settles_with_signer_not_nominee(self):
+        for nominee in ("A", "D", "B"):
+            for ballot in (nominee, "G"):
+                with self.subTest(nominee=nominee, ballot=ballot):
+                    s = rules.opening_state(SEED)
+                    s["houses"][nominee]["prestige"] = 16
+                    if nominee != "D":
+                        rules.relationship(s, "D", nominee).update(trust=5, capital=10)
+                    else:
+                        s["houses"]["A"]["scandal"] = 5
+                        s["houses"]["F"]["scandal"] = 5
+                    out = {"events": []}
+                    rules.player_court(s, 4, {"type": "coalition", "target": "D",
+                                             "candidate": nominee}, "no", out)
+                    self.assertTrue(any(e["code"] == "coalition_formed"
+                                        for e in out["events"]))
+                    for voter in ("A", "D"):
+                        self.assertEqual(rules.promised(s, voter, 4), nominee)
+                    before = deepcopy(rules.relationship(s, "A", "D"))
+                    result, election = self.election(s, candidate=ballot)
+                    self.assertEqual(election["election_votes"]["D"]["candidate"], nominee)
+                    broken = [e for e in election["events"]
+                              if e["code"] == "player_broke_coalition"]
+                    self.assertEqual(len(broken), int(ballot != nominee))
+                    self.assertEqual(rules.relationship(result, "A", "D")["trust"],
+                                     before["trust"] - (2 if ballot != nominee else 0))
+
+    def test_ordinary_backing_still_requires_voter_nominee_pact(self):
+        s = self.state
+        out = {"events": []}
+        self.assertTrue(rules.sign_contract(s, "D", "A", 1, out, "player_offer"))
+        self.assertEqual(rules.promised(s, "D", 4), "A")
+        del s["contracts"][0]["partner"]  # Legacy ordinary backing stays valid.
+        self.assertEqual(rules.promised(s, "D", 4), "A")
+        self.assertTrue(rules.sign_contract(s, "B", "E", 1, out, "npc_offer"))
+        self.assertFalse(rules.sign_contract(s, "B", "A", 1, out, "player_offer"))
+        self.assertEqual(rules.promised(s, "B", 4), "E")
+        s["pacts"] = []
+        self.assertIsNone(rules.promised(s, "D", 4))
 
     def test_terminal_pact_expires_after_round_inclusively(self):
         s = self.state
